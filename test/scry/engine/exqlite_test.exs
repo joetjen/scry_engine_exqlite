@@ -207,6 +207,25 @@ defmodule Scry.Engine.ExqliteTest do
       assert length(rows) == 2
       assert rows |> Enum.sort_by(& &1["id"]) |> Enum.map(& &1["name"]) == ["Alice", "Bob"]
     end
+
+    test "the schema-checked (eager) path also accumulates correctly across multiple chunks, using this module's own configured chunk size, not exqlite's own 50-row default",
+         %{conn: conn} do
+      Application.put_env(:scry_engine_exqlite, :chunk_size, 1)
+      on_exit(fn -> Application.delete_env(:scry_engine_exqlite, :chunk_size) end)
+
+      # `age > 0` forces the schema-checked (eager `fetch_all/3`) path,
+      # not the plain streamed `rows_stream/3` path the test above
+      # already covers.
+      query = %Query{
+        source: ["users"],
+        wheres: [{:cmp, :gt, ["age"], 0}],
+        select: [{:field, ["id"]}, {:field, ["name"]}]
+      }
+
+      assert {:ok, rows} = materialize(Engine.execute(conn, query, %{}))
+      assert length(rows) == 2
+      assert rows |> Enum.sort_by(& &1["id"]) |> Enum.map(& &1["name"]) == ["Alice", "Bob"]
+    end
   end
 
   describe "a type-affinity mismatch declines rather than risk a wrong result" do

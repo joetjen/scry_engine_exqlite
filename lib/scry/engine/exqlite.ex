@@ -153,12 +153,19 @@ defmodule Scry.Engine.Exqlite do
   # Eager, not the lazy `rows_stream/3` used elsewhere -- the
   # surrounding transaction must not still be open by the time this
   # returns, so every row is drained and the statement released before
-  # `COMMIT` runs.
+  # `COMMIT` runs. `fetch_all/3`, with this module's own `chunk_size/0`
+  # explicit -- `fetch_all/2` defaults to *exqlite's own* chunk size
+  # (50 rows/NIF call), a real, measured cost found reasoning through
+  # `exqlite`'s own source after the schema-check/Row-output fixes
+  # alone barely moved a large (1,000,000-row) `GROUP BY`'s own
+  # duration: 50 rows/call means 20,000 NIF round trips for a result
+  # this size, 40x more than the 2,000-row chunking `rows_stream/3`
+  # (and raw SQL's own benchmark comparison) already use.
   defp run_sql_eager(db, %{sql: sql, bind_params: bind_params}) do
     with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, sql),
          :ok <- Exqlite.Sqlite3.bind(stmt, bind_params),
          {:ok, raw_columns} <- Exqlite.Sqlite3.columns(db, stmt),
-         {:ok, rows} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
+         {:ok, rows} <- Exqlite.Sqlite3.fetch_all(db, stmt, chunk_size()) do
       Exqlite.Sqlite3.release(db, stmt)
       index = raw_columns |> Enum.map(&to_string/1) |> Row.build_index()
       {:ok, Enum.map(rows, &Row.new(index, &1))}
