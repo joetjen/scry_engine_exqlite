@@ -1,7 +1,7 @@
 defmodule Scry.Engine.Exqlite.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "1.0.0"
 
   # `mix precommit` includes `test` as a step; without this, Mix runs
   # the whole alias chain (including `mix test`) in :dev, and `mix test`
@@ -86,8 +86,9 @@ defmodule Scry.Engine.Exqlite.MixProject do
 
   defp description do
     "A real, kind-independent Scry.Core.EngineBehaviour implementation over SQLite via " <>
-      "exqlite -- batched fetch/2 streaming plus a fetch/3 WHERE-clause pushdown translator, " <>
-      "over a connection opened once and reused across calls."
+      "exqlite -- a single authoritative execute/3 compiling WHERE/GROUP BY/aggregates/" <>
+      "ORDER BY/DISTINCT/LIMIT/OFFSET into one native SQL statement, over a connection " <>
+      "opened once and reused across calls."
   end
 
   defp package do

@@ -3,23 +3,19 @@
 A real, kind-independent [`Scry.Core.EngineBehaviour`](https://github.com/joetjen/scry_core)
 implementation over [SQLite](https://www.sqlite.org/) via
 [`exqlite`](https://github.com/elixir-sqlite/exqlite)'s own low-level
-`Exqlite.Sqlite3` API — `fetch/2` streams a full table in batches
-(`multi_step/3`, not the one-row-per-NIF-call `step/2`); `fetch/3`
-translates whatever top-level, literal-valued `WHERE` comparisons it
-recognizes into a real SQL `WHERE` clause with bound parameters,
-falling back to an unfiltered scan for anything it doesn't; `fetch/4`
-additionally prunes `SELECT` to only the columns a query actually
-references and returns a compact, positional row instead of a map per
-row; `aggregate/5` pushes a `GROUP BY`/aggregate query's own
-computation down into a real, native SQL `GROUP BY` instead of
-`Scry.Core.Executor` fetching every row and computing it in Elixir.
-`Scry.Core.Executor` prefers whichever of these is implemented
-automatically, no caller-side changes needed.
+`Exqlite.Sqlite3` API. A single authoritative `execute/3` compiles the
+*entire* flat query — `WHERE`/`GROUP BY`/aggregates/`ORDER BY`/
+`DISTINCT`/`LIMIT`/`OFFSET`/projection — into one native SQL statement,
+all or nothing: either the whole query is genuinely correct as native
+SQL, or `execute/3` declines it with a clean `{:error, {:unsupported,
+detail}}` and no attempt is made. There is no downstream fallback or
+re-verification anywhere in this pipeline any more — an engine that
+accepts a query fully owns its correctness.
 
 Kind-independent by construction, like every engine in this family: it
-only ever sees the `source`/`Scry.Core.Query.t()` shapes `Scry.Core.
-Executor` already produces once any kind-specific vocabulary (`LAST`,
-eventually `via`/`hops`, ...) has been lowered away.
+only ever sees the `source`/`Scry.Core.Query.t()` shapes already
+produced once any kind-specific vocabulary (`LAST`, eventually `via`/
+`hops`, ...) has been lowered away.
 
 Source: <https://github.com/joetjen/scry_engine_exqlite>. Specs live in
 the separate [`scry`](https://github.com/joetjen/scry) repository; the
@@ -40,77 +36,63 @@ Scry.Engine.Exqlite.Conn.close(conn)
 ```
 
 `Conn.open/2` is meant to be called once and the resulting connection
-reused across many `fetch` calls -- opening a fresh connection per
+reused across many `execute/3` calls -- opening a fresh connection per
 call is wasteful and is *not* what this package does internally.
 Creating tables, indexes, and schema is entirely the caller's own job;
-this package is schema-agnostic and issues nothing but `SELECT`
-statements.
+this package is schema-agnostic and issues nothing but `SELECT`/
+`PRAGMA table_info` statements.
 
 ### What gets pushed down
 
-`fetch/3` recognizes top-level `wheres` entries (and the leaves of any
-top-level `{:and, ...}` chain among them) shaped like `{:cmp, op, [field],
-value}`, where `field` is a single, valid SQL identifier and `value` is
-a plain string, integer, or float -- `nil`, booleans, `{:field, ...}`,
-and `{:param, ...}` right-hand sides are deliberately never pushed down
-(SQLite's own `NULL`/boolean-as-integer semantics don't reliably match
-this project's own comparison semantics, and a `{:param, ...}` value
-isn't available at translation time at all) -- each such entry becomes
-its own `<field> <op> ?` fragment, AND-joined into a real `WHERE`
-clause. Anything else (`:or`, `:not`, `:in`, a multi-segment field, an
-untranslatable value) is simply left out of the pushed-down clause and
-re-checked by `Scry.Core.Executor` afterward, exactly this family's own
-"never wrong, not always complete" posture.
+`Scry.Engine.Exqlite.SqlCompiler` translates a flat query into SQL only
+when it can do so *completely* — every `select` item is a bare field
+(or, for a `GROUP BY` query, one of `sum`/`avg`/`count`/`min`/`max`/
+`count(distinct ...)` over a bare field), `wheres` translates fully
+(recursive `:cmp`/`:in`/`:and`/`:or`/`:not`, `Scry.Engine.Exqlite.
+WhereTranslator`), and there is no `HAVING`/`ROLLUP`/`CUBE`/window
+function/nested `SELECT`/`WITH`-bound source anywhere in the query.
+Anything that doesn't fully qualify is a clean `{:error, {:unsupported,
+detail}}` — never a partial pushdown silently finished off in Elixir.
 
-### Column pruning + compact rows (`fetch/4`)
+A nested/correlated `SELECT` body item, or a `WITH`-bound source, is
+delegated whole to `Scry.Core.QueryOps.run_document/4` instead —
+recursing back into this same module's `execute/3` for each flat leaf
+it resolves, so native pushdown still applies to those leaves.
 
-`Scry.Core.Executor` statically determines, per query, exactly which
-top-level columns a source needs and passes them along as `opts.
-columns` -- `{:ok, columns}` becomes `SELECT <columns> FROM table`
-instead of `SELECT *`; `:unknown` (a nested `SELECT` or a window
-function anywhere in `select` -- `Scry.Core.Executor`'s own moduledoc
-has the full eligibility rules) falls back to `SELECT *`, byte-identical
-to `fetch/2`/`fetch/3`'s own behavior. Either way, rows come back as
-`Scry.Core.Row` values -- a shared column-index map built once per
-fetch, paired with each row's own positional values tuple -- instead of
-a brand-new map built for every single row, real avoidable cost for a
-`GROUP BY`/`WHERE` scan over a large table that only needs a handful of
-its many columns. `Scry.Core.Executor` re-applies the query's full
-semantics to whatever comes back regardless, the same safety invariant
-every `fetch` arity here already has.
+### Two schema-level correctness checks, run in one transaction with the query itself
 
-### `GROUP BY`/aggregate pushdown (`aggregate/5`)
+SQL's own `WHERE`/aggregate semantics silently skip/exclude `NULL`
+values with no way to raise — Scry's own language spec requires a hard
+null-safety error instead. Every column compared against a non-`nil`
+literal in `wheres`, and every aggregated column, must be schema-level
+`NOT NULL` (`PRAGMA table_info`, an `INTEGER PRIMARY KEY`/`ROWID` alias
+counting as guaranteed-not-null too, despite `notnull: 0` in its own
+schema row) or the whole query is declined with `{:error, {:unsupported,
+{:nullable_column, columns}}}`.
 
-A genuinely stricter contract than `fetch/3`/`fetch/4`'s own lenient
-pushdown -- grouping is irreversible, so a wrong or incomplete pushdown
-can't be corrected downstream the way an over-fetched row set can
-(`Scry.Core.EngineBehaviour.aggregate/5`'s own moduledoc has the full
-reasoning). Three things all have to hold before this issues a native
-`SUM`/`COUNT`/`MIN`/`MAX`/`COUNT(DISTINCT ...)`, or it declines
-gracefully (`:not_supported`, `Scry.Core.Executor` falls back to
-computing it row-by-row, exactly as if this callback didn't exist):
+Found by property testing, not assumed: SQLite's type-affinity-based
+comparison rules can disagree with this project's own Erlang-term-order
+comparison semantics for `<`/`>`/`<=`/`>=` across mismatched column/
+literal types (e.g. a `TEXT` column compared against an integer
+literal) — every ordering comparison's column is additionally checked
+against its own real SQLite type affinity (the same 5-rule algorithm
+SQLite itself uses), declining with `{:error, {:unsupported,
+{:type_mismatch, checks}}}` rather than risk a silently wrong ordering
+result.
 
-1. Every `GROUP BY`/aggregated column is a safe SQL identifier.
-2. `WHERE` is **fully** translatable -- including a `{:param, name}`
-   bound to a real value -- not just partially, unlike `fetch/3`'s own
-   leniency.
-3. Every aggregated column is schema-level `NOT NULL` (`PRAGMA
-   table_info`, checked in the same transaction as the aggregate query
-   itself). SQL's own aggregates silently skip `NULL` values; Scry's
-   own language spec requires a hard error instead -- this is the one
-   check standing in for that, and the one place this package is
-   schema-aware rather than schema-agnostic.
-
-`avg` is excluded from pushdown eligibility entirely -- SQLite's own
-`AVG()` always returns an inexact float, which would silently break
-Scry's own "exact rationals by default" numeric model.
+`avg` is pushdown-eligible and returns a native, inexact SQL float —
+`scry_core`'s own `CHANGELOG.md` has the full reasoning for relaxing
+the "exact rational arithmetic regardless of backend" guarantee to a
+per-engine capability. Relaxing exactness never meant relaxing the
+null-safety guarantee too — `avg`'s own target column is checked
+exactly like every other aggregate's.
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:scry_engine_exqlite, "~> 0.1.0"}
+    {:scry_engine_exqlite, "~> 1.0"}
   ]
 end
 ```

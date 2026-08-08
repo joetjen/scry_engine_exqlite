@@ -1,41 +1,35 @@
 defmodule Scry.Engine.Exqlite.WhereTranslator do
   @moduledoc """
-  Translates whatever it can recognize out of a `Scry.Core.Query.t()`'s
-  own `wheres` into a real SQL `WHERE` clause with bound `?`
-  parameters, for `Scry.Engine.Exqlite.fetch/3`'s own pushdown. Anything
-  it can't translate is simply left out of the clause -- `wheres` is a
-  list of predicates the caller already combines with `and`
-  (`Scry.Core.Query`'s own moduledoc), so dropping an untranslatable
-  entry only ever *widens* what SQLite itself returns, never narrows
-  it; `Scry.Core.Executor` re-checks every predicate afterward
-  regardless; this module only ever needs to be correct, never
-  complete.
+  Translates a `Scry.Core.Query.t()`'s own `wheres` into a real SQL
+  `WHERE` clause with bound `?` parameters, for `Scry.Engine.Exqlite`'s
+  own `execute/3`. All-or-nothing: `translate/2` returns `:error` the
+  moment *any* predicate anywhere in the tree can't be translated,
+  never a partial clause silently narrowing what SQLite returns --
+  there is no downstream re-verification left to catch an
+  under-translated (row-dropping) predicate the way the old, lenient
+  `fetch/3` contract's own re-application used to.
 
-  A top-level `{:and, left, right}` chain among `wheres` is flattened
-  first, so e.g. `WHERE id = 1 AND status = "active"` still gets both
-  legs pushed down even though they arrive as one nested predicate, not
-  two list entries.
+  A full recursive `{:and, l, r}`/`{:or, l, r}`/`{:not, p}` tree
+  translates, not just a flat, implicitly-`AND`ed list of leaves --
+  each combinator becomes its own parenthesized SQL group so operator
+  precedence can never differ from what the predicate tree itself
+  already encodes.
 
-  Only `{:cmp, op, [field], value}` leaves are candidates, and only
-  when all three hold: `op` is one of `:eq`/`:not_eq`/`:lt`/`:gt`/`:le`/
-  `:ge` (`:match` has no direct SQL equivalent); `field` is a single
-  segment that's also a valid, safe-to-interpolate SQL identifier (a
-  multi-segment path, or one that isn't, is left untranslated -- never
-  built into the SQL string unchecked); and `value` is a plain string,
-  integer, or float. `nil`, booleans, `{:field, ...}`, and
-  `{:param, ...}` are deliberately never translated: SQL's own `=
-  NULL`/boolean-as-integer semantics don't reliably match this
-  project's own comparison semantics (a naive translation risks
-  *under*-inclusion -- silently dropping a row a correct fetch would
-  have returned -- which is the one direction `Scry.Core.Executor`'s
-  own re-verification can never catch, per `Scry.Core.EngineBehaviour`'s
-  own safety invariant), and a `{:param, ...}` value isn't available at
-  translation time at all (`fetch/3` isn't handed `params`).
-
-  `translate_strict/2` (below) is a separate, stricter entry point for
-  `aggregate/5`'s own pushdown, which *is* handed `params` and *does*
-  need `{:param, ...}` translated -- see its own doc for why its
-  all-or-nothing contract has to differ from this function's leniency.
+  Only `{:cmp, op, [field], value}` and `{:in, [field], values}` leaves
+  are candidates, and only when: `field` is a single segment that's
+  also a valid, safe-to-interpolate SQL identifier (a multi-segment
+  path -- nested/JSON access -- is declined, not translated unchecked);
+  `op` is one of `:eq`/`:not_eq`/`:lt`/`:gt`/`:le`/`:ge` (`:match` has
+  no native SQLite equivalent); and every value involved (a literal, or
+  a `{:param, name}` resolved against `params`) is a plain string,
+  integer, or float, **or** the literal `nil` specifically for `:eq`/
+  `:not_eq` -- translated to `IS NULL`/`IS NOT NULL`, not a naive
+  `= ?`/`!= ?` bound to `NULL` (SQL's own `x = NULL` is always `NULL`,
+  never `TRUE`, so a literal translation there would silently change
+  what the clause means). Booleans are deliberately never translated --
+  SQLite has no native boolean type, and guessing whether a column
+  stores `0`/`1` integers or a real `SQLite ≥ 3.23` boolean literal
+  isn't safe to assume.
   """
 
   alias Scry.Core.Query
@@ -44,101 +38,132 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
   @identifier ~r/^[A-Za-z_][A-Za-z0-9_]*$/
 
   @doc """
-  Returns `{where_sql, params}` -- `where_sql` is either `""` (nothing
-  translatable) or a `" WHERE ..."` fragment (leading space included,
-  ready to append directly after a table name), `params` the bound
-  values in the same left-to-right order as the `?` placeholders.
+  Returns `{:ok, where_sql, params}` -- `where_sql` is either `""`
+  (an empty `wheres`) or a `" WHERE ..."` fragment (leading space
+  included, ready to append directly after a table/`GROUP BY` clause),
+  `params` the bound values in the same left-to-right order as the `?`
+  placeholders -- or `:error` the moment anything in `wheres` doesn't
+  translate.
   """
-  @spec translate([Query.predicate()]) :: {String.t(), [term()]}
-  def translate(wheres) do
+  @spec translate([Query.predicate()], map()) :: {:ok, String.t(), [term()]} | :error
+  def translate(wheres, params) do
     wheres
-    |> Enum.flat_map(&flatten_and/1)
-    |> Enum.flat_map(&translate_leaf/1)
-    |> build_clause()
-  end
-
-  @doc """
-  Like `translate/1`, but for `Scry.Engine.Exqlite.aggregate/5`'s own
-  genuinely stricter, all-or-nothing requirement -- grouping is
-  irreversible, so there's no safe way to apply a leftover,
-  untranslated predicate *after* SQL has already aggregated rows away,
-  the way `translate/1`'s own leniency (silently drop what can't be
-  translated, `Scry.Core.Executor` re-checks everything downstream
-  regardless) relies on. Returns `:error` the moment *any* `wheres`
-  predicate can't be translated, rather than silently narrowing.
-
-  Also resolves `{:param, name}` against `bound_params` -- `translate/1`
-  never does this (`fetch/3` isn't handed `params` at all), but
-  `aggregate/5` is, so a query filtering by a runtime-bound value (the
-  overwhelmingly common real case) can still reach 100% translatability
-  instead of declining pushdown outright.
-  """
-  @spec translate_strict([Query.predicate()], map()) :: {:ok, String.t(), [term()]} | :error
-  def translate_strict(wheres, bound_params) do
-    wheres
-    |> Enum.flat_map(&flatten_and/1)
     |> Enum.reduce_while({:ok, []}, fn predicate, {:ok, acc} ->
-      case translate_leaf_strict(predicate, bound_params) do
-        {:ok, clause} -> {:cont, {:ok, [clause | acc]}}
+      case translate_predicate(predicate, params) do
+        {:ok, sql, bound} -> {:cont, {:ok, [{sql, bound} | acc]}}
         :error -> {:halt, :error}
       end
     end)
     |> case do
-      {:ok, reversed_clauses} ->
-        {where_sql, params} = build_clause(Enum.reverse(reversed_clauses))
-        {:ok, where_sql, params}
+      {:ok, []} ->
+        {:ok, "", []}
+
+      {:ok, reversed} ->
+        {sql, bound} = build_clause(Enum.reverse(reversed))
+        {:ok, sql, bound}
 
       :error ->
         :error
     end
   end
 
-  defp flatten_and({:and, left, right}), do: flatten_and(left) ++ flatten_and(right)
-  defp flatten_and(predicate), do: [predicate]
-
-  defp translate_leaf({:cmp, op, [field], value}) do
-    with {:ok, sql_op} <- Map.fetch(@op_sql, op),
-         true <- identifier?(field),
-         true <- literal?(value) do
-      [{"#{field} #{sql_op} ?", value}]
-    else
-      _ -> []
-    end
+  defp build_clause(clauses) do
+    {fragments, param_lists} = Enum.unzip(clauses)
+    {" WHERE " <> Enum.join(fragments, " AND "), List.flatten(param_lists)}
   end
 
-  defp translate_leaf(_predicate), do: []
+  # `{:cmp, op, lhs, nil}`'s own null-check idiom -- `field = NULL` is
+  # always `NULL` in SQL, never `TRUE`, so this is a real, dedicated
+  # translation, not the general clause below with `nil` bound as an
+  # ordinary parameter.
+  defp translate_predicate({:cmp, :eq, [field], nil}, _params) do
+    if identifier?(field), do: {:ok, "#{field} IS NULL", []}, else: :error
+  end
 
-  defp translate_leaf_strict({:cmp, op, [field], value}, bound_params) do
+  defp translate_predicate({:cmp, :not_eq, [field], nil}, _params) do
+    if identifier?(field), do: {:ok, "#{field} IS NOT NULL", []}, else: :error
+  end
+
+  defp translate_predicate({:cmp, op, [field], value}, params) do
     with {:ok, sql_op} <- Map.fetch(@op_sql, op),
          true <- identifier?(field),
-         {:ok, resolved} <- resolve_strict_value(value, bound_params) do
-      {:ok, {"#{field} #{sql_op} ?", resolved}}
+         {:ok, resolved} <- resolve_value(value, params) do
+      {:ok, "#{field} #{sql_op} ?", [resolved]}
     else
       _ -> :error
     end
   end
 
-  defp translate_leaf_strict(_predicate, _bound_params), do: :error
+  defp translate_predicate({:in, [field], values}, params) when is_list(values) do
+    with true <- identifier?(field),
+         {:ok, resolved} when resolved != [] <- resolve_all(values, params) do
+      placeholders = resolved |> Enum.map(fn _ -> "?" end) |> Enum.join(", ")
+      {:ok, "#{field} IN (#{placeholders})", resolved}
+    else
+      _ -> :error
+    end
+  end
 
-  defp resolve_strict_value({:param, name}, bound_params) do
-    case Map.fetch(bound_params, name) do
+  # `in` against a non-literal-list expr (a field/call expected to
+  # resolve to a list at runtime) has no direct SQL translation without
+  # a JSON table function -- declined, not attempted this increment.
+  defp translate_predicate({:in, _lhs, _list_expr}, _params), do: :error
+
+  defp translate_predicate({:and, l, r}, params) do
+    with {:ok, sql_l, params_l} <- translate_predicate(l, params),
+         {:ok, sql_r, params_r} <- translate_predicate(r, params) do
+      {:ok, "(#{sql_l} AND #{sql_r})", params_l ++ params_r}
+    else
+      _ -> :error
+    end
+  end
+
+  defp translate_predicate({:or, l, r}, params) do
+    with {:ok, sql_l, params_l} <- translate_predicate(l, params),
+         {:ok, sql_r, params_r} <- translate_predicate(r, params) do
+      {:ok, "(#{sql_l} OR #{sql_r})", params_l ++ params_r}
+    else
+      _ -> :error
+    end
+  end
+
+  defp translate_predicate({:not, p}, params) do
+    case translate_predicate(p, params) do
+      {:ok, sql, bound} -> {:ok, "NOT (#{sql})", bound}
+      :error -> :error
+    end
+  end
+
+  # A bare-path/`{:call, ...}`/`{:dot, ...}` `lhs` on a `:cmp` (rather
+  # than the `[field]` single-segment shape every clause above already
+  # matches) and anything else this module doesn't recognize.
+  defp translate_predicate(_other, _params), do: :error
+
+  defp resolve_all(values, params) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
+      case resolve_value(value, params) do
+        {:ok, resolved} -> {:cont, {:ok, [resolved | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      :error -> :error
+    end
+  end
+
+  defp resolve_value({:param, name}, params) do
+    case Map.fetch(params, name) do
       {:ok, value} -> if literal?(value), do: {:ok, value}, else: :error
       :error -> :error
     end
   end
 
-  defp resolve_strict_value(value, _bound_params) do
-    if literal?(value), do: {:ok, value}, else: :error
-  end
+  defp resolve_value(value, _params), do: if(literal?(value), do: {:ok, value}, else: :error)
 
-  defp identifier?(field), do: is_binary(field) and Regex.match?(@identifier, field)
+  @doc "Whether `field` is a safe-to-interpolate SQL identifier -- also used by `Scry.Engine.Exqlite.SqlCompiler`."
+  @spec identifier?(term()) :: boolean()
+  def identifier?(field), do: is_binary(field) and Regex.match?(@identifier, field)
 
   defp literal?(value), do: is_binary(value) or is_integer(value) or is_float(value)
-
-  defp build_clause([]), do: {"", []}
-
-  defp build_clause(clauses) do
-    {fragments, params} = Enum.unzip(clauses)
-    {" WHERE " <> Enum.join(fragments, " AND "), params}
-  end
 end
