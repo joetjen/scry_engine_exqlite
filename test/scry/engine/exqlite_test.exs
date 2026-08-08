@@ -79,6 +79,17 @@ defmodule Scry.Engine.ExqliteTest do
              ]
     end
 
+    test "a bare field under an explicit alias (as Scry.Core.Query.from/2's map select: always produces) still pushes down",
+         %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        select: [{:computed, "n", {:field, ["name"]}}]
+      }
+
+      assert {:ok, rows} = materialize(Engine.execute(conn, query, %{}))
+      assert Enum.sort(rows) == Enum.sort([%{"n" => "Alice"}, %{"n" => "Bob"}])
+    end
+
     test "a WHERE on a schema-NOT-NULL column pushes down and narrows correctly", %{conn: conn} do
       query = %Query{
         source: ["users"],

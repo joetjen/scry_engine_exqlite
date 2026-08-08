@@ -10,6 +10,10 @@
   A nested/correlated `SELECT` body item or a `WITH`-bound source is delegated whole to `Scry.Core.QueryOps.run_document/4`, recursing back into this same module's `execute/3` for each flat leaf it resolves.
   `HAVING`, `ROLLUP`/`CUBE`, window functions, and any non-bare-field `select` item (casts, arithmetic) are explicitly out of scope for this increment and decline cleanly rather than attempting a fragile partial translation.
 
+### Fixed
+
+- `SqlCompiler` now accepts a bare field under an explicit alias (`{:computed, alias, {:field, [column]}}`) as a plain `select` item or a `GROUP BY`-matching column, not just an unaliased `{:field, [column]}` -- found auditing `scry_test_core`'s own cross-engine parity suite: `Scry.Core.Query.from/2`'s map-shaped `select:` always wraps every entry this way, even a plain field reference, so a query built through the native Layer 2 front end was declining pushdown it should have gotten.
+
 ### Added
 
 - Initial release: `Scry.Engine.Exqlite` -- a real, kind-independent `Scry.Core.EngineBehaviour` implementation over SQLite via `exqlite`'s own low-level `Exqlite.Sqlite3` API. `fetch/2` streams a full table in batches via `Exqlite.Sqlite3.multi_step/3` (2,000 rows/NIF call by default, `config :scry_engine_exqlite, chunk_size: n` to override) rather than one-row-per-NIF-call `step/2`. `fetch/3` additionally runs `query.wheres` through `Scry.Engine.Exqlite.WhereTranslator` and appends whatever real SQL `WHERE` clause it can build (bound `?` parameters, never string-interpolated values), falling back to `fetch/2`'s own unfiltered scan for anything it can't translate.

@@ -100,6 +100,25 @@ defmodule Scry.Engine.Exqlite.AggregateTest do
              ]
     end
 
+    test "a GROUP BY column under an explicit alias (as Scry.Core.Query.from/2's map select: always produces) still pushes down",
+         %{conn: conn} do
+      query = %Query{
+        source: ["orders"],
+        group_bys: [["user_id"]],
+        select: [
+          {:computed, "uid", {:field, ["user_id"]}},
+          {:computed, "total", {:call, "sum", [{:field, ["amount"]}]}}
+        ]
+      }
+
+      assert {:ok, rows} = run(query, conn)
+
+      assert Enum.sort_by(rows, & &1["uid"]) == [
+               %{"uid" => 1, "total" => 30},
+               %{"uid" => 2, "total" => 12}
+             ]
+    end
+
     test "avg pushes down now, returning a native (inexact) float -- the deliberate exactness relaxation",
          %{conn: conn} do
       query = %Query{

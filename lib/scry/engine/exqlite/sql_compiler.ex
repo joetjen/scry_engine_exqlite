@@ -15,18 +15,22 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
   - `wheres`: delegated to `Scry.Engine.Exqlite.WhereTranslator`, whose
     own moduledoc has the exact predicate shapes it accepts.
   - A **plain** (non-aggregate) query: every `select` item must be a
-    bare, single-segment `{:field, [column]}` -- a computed expression
-    (a cast, arithmetic, `WHEN`, a window function) has no translation
-    here and declines the whole query, not just that one item.
+    bare, single-segment `{:field, [column]}`, optionally under an
+    explicit alias (`{:computed, alias, {:field, [column]}}` --
+    `Scry.Core.Query.from/2`'s own map-shaped `select:` always wraps
+    every entry this way, even a plain field reference) -- a genuine
+    computed expression (a cast, arithmetic, `WHEN`, a window function)
+    has no translation here and declines the whole query, not just
+    that one item.
   - An **aggregate**-shaped query (`group_bys != []`, or any
     `sum`/`avg`/`count`/`min`/`max` call anywhere in `select`):
     `group_mode: :plain` only (`ROLLUP`/`CUBE` decline); every
-    `select` item is either a bare field matching one of `group_bys`
-    exactly, or one of `sum`/`avg`/`count`/`min`/`max` called with
-    exactly one bare-field argument (`count(distinct field)`
-    included); `havings == []` (a real `HAVING` clause is a
-    genuinely separate translation problem, deferred, not attempted
-    this increment).
+    `select` item is either a bare field (optionally aliased, same as
+    above) matching one of `group_bys` exactly, or one of `sum`/`avg`/
+    `count`/`min`/`max` called with exactly one bare-field argument
+    (`count(distinct field)` included); `havings == []` (a real
+    `HAVING` clause is a genuinely separate translation problem,
+    deferred, not attempted this increment).
   - `order_bys`: every entry a bare, single-segment field.
   - `distinct`/`limit`/`offset`: always compile directly (`limit`/
     `offset` are already validated `non_neg_integer() | nil` by
@@ -182,6 +186,18 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
     end
   end
 
+  # A bare field under a caller-given alias (e.g. `Scry.Core.Query.
+  # from/2`'s map-shaped `select:` always wraps every entry, even a
+  # plain field reference, in `{:computed, alias, ...}}`) -- still just
+  # `column AS alias`, no cast/arithmetic/function call involved.
+  defp plain_select_item({:computed, alias_name, {:field, [field]}}) do
+    if WhereTranslator.identifier?(field) do
+      {:ok, "#{field} AS #{quote_ident(alias_name)}"}
+    else
+      :error
+    end
+  end
+
   defp plain_select_item(_other), do: :error
 
   # ---- aggregate-shaped queries --------------------------------------------
@@ -257,6 +273,19 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
   defp aggregate_select_item({:field, [field]}, group_by_cols) do
     if field in group_by_cols do
       {:ok, %{sql: "#{field} AS #{quote_ident(field)}", not_null: []}}
+    else
+      :error
+    end
+  end
+
+  # The same bare-`GROUP BY`-column case as above, just under the
+  # alias a caller (e.g. `Scry.Core.Query.from/2`'s map-shaped
+  # `select:`) gave it explicitly, rather than the query's own field
+  # name -- `{:computed, alias, {:field, [field]}}` compiles to the
+  # exact same "no representative row" reasoning applies here.
+  defp aggregate_select_item({:computed, alias_name, {:field, [field]}}, group_by_cols) do
+    if field in group_by_cols do
+      {:ok, %{sql: "#{field} AS #{quote_ident(alias_name)}", not_null: []}}
     else
       :error
     end
