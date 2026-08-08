@@ -463,4 +463,16 @@ defmodule Scry.Engine.ExqliteTest do
              ]
     end
   end
+
+  describe "describe_source/2 (Scry.Core.EngineBehaviour's optional callback)" do
+    test "delegates to Scry.Engine.Exqlite.Schema.describe_source/2", %{conn: conn} do
+      assert {:ok, fields} = Engine.describe_source(conn, "users")
+      names = fields |> Enum.map(& &1.name) |> Enum.sort()
+      assert names == ["age", "id", "name", "status"]
+    end
+
+    test "an unknown source is {:error, :not_found}", %{conn: conn} do
+      assert {:error, :not_found} = Engine.describe_source(conn, "ghost_table")
+    end
+  end
 end

@@ -82,8 +82,8 @@ defmodule Scry.Engine.Exqlite do
 
   @behaviour Scry.Core.EngineBehaviour
 
-  alias Scry.Core.{CombinedQuery, Query, QueryOps, Row}
-  alias Scry.Engine.Exqlite.{Conn, SqlCompiler}
+  alias Scry.Core.{CombinedQuery, EngineBehaviour, Query, QueryOps, Row}
+  alias Scry.Engine.Exqlite.{Conn, Schema, SqlCompiler}
 
   @default_chunk_size 2_000
 
@@ -137,7 +137,7 @@ defmodule Scry.Engine.Exqlite do
     case Exqlite.Sqlite3.execute(db, "BEGIN DEFERRED") do
       :ok ->
         result =
-          case schema_check(conn, table, compiled.not_null_columns, compiled.type_checks) do
+          case Schema.verify(conn, table, compiled.not_null_columns, compiled.type_checks) do
             :ok -> run_sql_eager(db, compiled)
             {:error, _} = error -> error
           end
@@ -174,140 +174,19 @@ defmodule Scry.Engine.Exqlite do
     end
   end
 
-  defp schema_check(%Conn{db: db, schema_cache: nil}, table, not_null_columns, type_checks) do
-    with {:ok, rows} <- fetch_table_info(db, table) do
-      verify_schema(rows, not_null_columns, type_checks)
-    end
-  end
-
-  defp schema_check(%Conn{db: db, schema_cache: cache}, table, not_null_columns, type_checks) do
-    with {:ok, rows} <- cached_table_info(db, cache, table) do
-      verify_schema(rows, not_null_columns, type_checks)
-    end
-  end
-
-  # `PRAGMA table_info` is re-fetched only when SQLite's own `PRAGMA
-  # schema_version` (a single, cheap integer read -- bumped by *any*
-  # schema-altering statement against this database file, from any
-  # connection, not just this one) disagrees with what's cached. Both
-  # still run inside the same transaction `run_sql_with_schema_check/3`
-  # already opened, so a schema change between the version check and
-  # the compiled query itself is still caught, exactly as if caching
-  # didn't exist -- this only ever skips the (comparatively expensive)
-  # `table_info` round trip, never the freshness guarantee itself.
-  defp cached_table_info(db, cache, table) do
-    with {:ok, version} <- schema_version(db) do
-      case :ets.lookup(cache, table) do
-        [{^table, ^version, rows}] ->
-          {:ok, rows}
-
-        _stale_or_missing ->
-          with {:ok, rows} <- fetch_table_info(db, table) do
-            :ets.insert(cache, {table, version, rows})
-            {:ok, rows}
-          end
-      end
-    end
-  end
-
-  defp schema_version(db) do
-    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, "PRAGMA schema_version"),
-         {:ok, [[version]]} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
-      Exqlite.Sqlite3.release(db, stmt)
-      {:ok, version}
-    else
-      {:error, reason} -> {:error, {:query_error, reason}}
-    end
-  end
-
-  defp fetch_table_info(db, table) do
-    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, "PRAGMA table_info(#{table})"),
-         {:ok, rows} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
-      Exqlite.Sqlite3.release(db, stmt)
-      {:ok, rows}
-    else
-      {:error, reason} -> {:error, {:query_error, reason}}
-    end
-  end
-
-  # `PRAGMA table_info` for a table that doesn't exist returns an
-  # empty result set, not an error -- indistinguishable, from this
-  # query alone, from "a real table with zero columns" (which never
-  # happens in practice). Found directly (not assumed): without this
-  # clause, an unknown-source aggregate query reported a misleading
-  # `{:unsupported, {:nullable_column, ...}}}` instead of the real
-  # "no such table" error -- `[]` here means "proceed", letting the
-  # compiled query itself surface the genuine `{:query_error, ...}`
-  # once it actually runs.
-  defp verify_schema([], _not_null_columns, _type_checks), do: :ok
-
-  defp verify_schema(rows, not_null_columns, type_checks) do
-    guaranteed_not_null =
-      rows
-      |> Enum.filter(&column_guaranteed_not_null?(&1, rows))
-      |> MapSet.new(fn [_cid, name, _type, _notnull, _dflt, _pk] -> name end)
-
-    affinities =
-      Map.new(rows, fn [_cid, name, type, _notnull, _dflt, _pk] ->
-        {name, column_affinity(type)}
-      end)
-
-    cond do
-      not Enum.all?(not_null_columns, &MapSet.member?(guaranteed_not_null, &1)) ->
-        {:error, {:unsupported, {:nullable_column, not_null_columns}}}
-
-      not Enum.all?(type_checks, fn {column, class} -> Map.get(affinities, column) == class end) ->
-        {:error, {:unsupported, {:type_mismatch, type_checks}}}
-
-      true ->
-        :ok
-    end
-  end
-
-  # A schema-declared `NOT NULL` is the ordinary case. The one
-  # deliberate exception: a single-column `INTEGER PRIMARY KEY` is a
-  # real SQLite `ROWID` alias -- confirmed directly (not assumed),
-  # `PRAGMA table_info` reports `notnull: 0` for one even though no
-  # persisted row can ever actually read back a `NULL` there (it *is*
-  # the row's own rowid). Narrow on purpose: a `TEXT`/composite
-  # primary key gets no such exception -- SQLite has never guaranteed
-  # `NOT NULL` for those the way it does for this one specific,
-  # documented rowid-alias shape.
-  defp column_guaranteed_not_null?([_cid, _name, _type, 1, _dflt, _pk], _all_rows), do: true
-
-  defp column_guaranteed_not_null?([_cid, _name, type, 0, _dflt, pk], all_rows) do
-    pk == 1 and String.upcase(to_string(type)) == "INTEGER" and
-      Enum.count(all_rows, fn [_, _, _, _, _, pk] -> pk != 0 end) == 1
-  end
-
-  # SQLite's own 5-rule type affinity algorithm
-  # (https://www.sqlite.org/datatype3.html#type_affinity), simplified
-  # to the two classes `Scry.Engine.Exqlite.SqlCompiler`'s own
-  # `type_checks` ever asks about -- a column whose declared type
-  # doesn't clearly fall into either is treated as incompatible with
-  # both (never assumed safe).
-  defp column_affinity(declared_type) do
-    type = declared_type |> to_string() |> String.upcase()
-
-    cond do
-      String.contains?(type, "INT") ->
-        :numeric
-
-      String.contains?(type, "CHAR") or String.contains?(type, "CLOB") or
-          String.contains?(type, "TEXT") ->
-        :text
-
-      String.contains?(type, "REAL") or String.contains?(type, "FLOA") or
-          String.contains?(type, "DOUB") ->
-        :numeric
-
-      type == "" or String.contains?(type, "BLOB") ->
-        nil
-
-      true ->
-        :numeric
-    end
-  end
+  @doc """
+  `Scry.Core.EngineBehaviour`'s optional `describe_source/2` callback --
+  delegates straight to `Scry.Engine.Exqlite.Schema.describe_source/2`,
+  which routes through the exact same per-`Conn` ETS cache the schema
+  check above already uses (that module's own moduledoc has the full
+  reasoning for sharing it).
+  """
+  @impl true
+  @spec describe_source(Conn.t(), String.t()) ::
+          {:ok, [EngineBehaviour.introspected_field()]}
+          | {:error, :not_found}
+          | {:error, {:introspection_error, term()}}
+  def describe_source(conn, source), do: Schema.describe_source(conn, source)
 
   defp rows_stream(db, stmt, index) do
     Stream.resource(
