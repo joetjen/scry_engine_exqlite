@@ -7,7 +7,11 @@ implementation over [SQLite](https://www.sqlite.org/) via
 (`multi_step/3`, not the one-row-per-NIF-call `step/2`); `fetch/3`
 translates whatever top-level, literal-valued `WHERE` comparisons it
 recognizes into a real SQL `WHERE` clause with bound parameters,
-falling back to an unfiltered scan for anything it doesn't.
+falling back to an unfiltered scan for anything it doesn't; `fetch/4`
+additionally prunes `SELECT` to only the columns a query actually
+references and returns a compact, positional row instead of a map per
+row -- `Scry.Core.Executor` prefers it automatically whenever it's
+implemented, no caller-side changes needed.
 
 Kind-independent by construction, like every engine in this family: it
 only ever sees the `source`/`Scry.Core.Query.t()` shapes `Scry.Core.
@@ -54,6 +58,23 @@ clause. Anything else (`:or`, `:not`, `:in`, a multi-segment field, an
 untranslatable value) is simply left out of the pushed-down clause and
 re-checked by `Scry.Core.Executor` afterward, exactly this family's own
 "never wrong, not always complete" posture.
+
+### Column pruning + compact rows (`fetch/4`)
+
+`Scry.Core.Executor` statically determines, per query, exactly which
+top-level columns a source needs and passes them along as `opts.
+columns` -- `{:ok, columns}` becomes `SELECT <columns> FROM table`
+instead of `SELECT *`; `:unknown` (a nested `SELECT` or a window
+function anywhere in `select` -- `Scry.Core.Executor`'s own moduledoc
+has the full eligibility rules) falls back to `SELECT *`, byte-identical
+to `fetch/2`/`fetch/3`'s own behavior. Either way, rows come back as
+`Scry.Core.Row` values -- a shared column-index map built once per
+fetch, paired with each row's own positional values tuple -- instead of
+a brand-new map built for every single row, real avoidable cost for a
+`GROUP BY`/`WHERE` scan over a large table that only needs a handful of
+its many columns. `Scry.Core.Executor` re-applies the query's full
+semantics to whatever comes back regardless, the same safety invariant
+every `fetch` arity here already has.
 
 ## Installation
 
