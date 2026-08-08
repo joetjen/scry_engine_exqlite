@@ -103,6 +103,82 @@ defmodule Scry.Engine.Exqlite.WhereTranslatorTest do
     end
   end
 
+  describe "translate_strict/2" do
+    test "an empty wheres list translates trivially" do
+      assert WhereTranslator.translate_strict([], %{}) == {:ok, "", []}
+    end
+
+    test "a fully-translatable wheres list succeeds, same shape as translate/1" do
+      wheres = [{:cmp, :eq, ["status"], "active"}, {:cmp, :gt, ["age"], 18}]
+
+      assert WhereTranslator.translate_strict(wheres, %{}) ==
+               {:ok, " WHERE status = ? AND age > ?", ["active", 18]}
+    end
+
+    test "a top-level {:and, ...} chain is flattened, same as translate/1" do
+      wheres = [{:and, {:cmp, :eq, ["id"], 1}, {:cmp, :eq, ["status"], "active"}}]
+
+      assert WhereTranslator.translate_strict(wheres, %{}) ==
+               {:ok, " WHERE id = ? AND status = ?", [1, "active"]}
+    end
+
+    test "a {:param, name} resolves against bound_params and binds like a literal" do
+      wheres = [{:cmp, :eq, ["tenant_id"], {:param, "tenant"}}]
+
+      assert WhereTranslator.translate_strict(wheres, %{"tenant" => 42}) ==
+               {:ok, " WHERE tenant_id = ?", [42]}
+    end
+
+    test "a missing param resolution declines the whole translation" do
+      wheres = [{:cmp, :eq, ["tenant_id"], {:param, "tenant"}}]
+      assert WhereTranslator.translate_strict(wheres, %{}) == :error
+    end
+
+    test "a param resolving to a non-literal (e.g. a list) declines the whole translation" do
+      wheres = [{:cmp, :eq, ["tenant_id"], {:param, "tenant"}}]
+      assert WhereTranslator.translate_strict(wheres, %{"tenant" => [1, 2]}) == :error
+    end
+
+    test "any single untranslatable predicate declines the WHOLE translation, unlike translate/1's own leniency" do
+      wheres = [
+        {:cmp, :eq, ["status"], "active"},
+        {:or, {:cmp, :eq, ["id"], 1}, {:cmp, :eq, ["id"], 2}}
+      ]
+
+      assert WhereTranslator.translate_strict(wheres, %{}) == :error
+    end
+
+    test "an untranslatable field (multi-segment, or unsafe identifier) declines the whole translation" do
+      assert WhereTranslator.translate_strict([{:cmp, :eq, ["a", "b"], 1}], %{}) == :error
+
+      assert WhereTranslator.translate_strict(
+               [{:cmp, :eq, ["bad; DROP TABLE users;--"], 1}],
+               %{}
+             ) == :error
+    end
+
+    test "nil/boolean/{:field, ...} right-hand sides still decline, same as translate/1" do
+      assert WhereTranslator.translate_strict([{:cmp, :eq, ["x"], nil}], %{}) == :error
+      assert WhereTranslator.translate_strict([{:cmp, :eq, ["x"], true}], %{}) == :error
+
+      assert WhereTranslator.translate_strict([{:cmp, :eq, ["x"], {:field, ["y"]}}], %{}) ==
+               :error
+    end
+
+    property "whenever it succeeds, the placeholder count always matches the bound param count" do
+      check all(wheres <- list_of(predicate_generator())) do
+        case WhereTranslator.translate_strict(wheres, %{"x" => 1}) do
+          {:ok, sql, params} ->
+            placeholder_count = sql |> String.graphemes() |> Enum.count(&(&1 == "?"))
+            assert placeholder_count == length(params)
+
+          :error ->
+            :ok
+        end
+      end
+    end
+  end
+
   describe "property: never raises, params always match placeholders" do
     property "the number of '?' placeholders always equals the number of bound params" do
       check all(wheres <- list_of(predicate_generator())) do

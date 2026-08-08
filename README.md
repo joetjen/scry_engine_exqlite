@@ -10,8 +10,11 @@ recognizes into a real SQL `WHERE` clause with bound parameters,
 falling back to an unfiltered scan for anything it doesn't; `fetch/4`
 additionally prunes `SELECT` to only the columns a query actually
 references and returns a compact, positional row instead of a map per
-row -- `Scry.Core.Executor` prefers it automatically whenever it's
-implemented, no caller-side changes needed.
+row; `aggregate/5` pushes a `GROUP BY`/aggregate query's own
+computation down into a real, native SQL `GROUP BY` instead of
+`Scry.Core.Executor` fetching every row and computing it in Elixir.
+`Scry.Core.Executor` prefers whichever of these is implemented
+automatically, no caller-side changes needed.
 
 Kind-independent by construction, like every engine in this family: it
 only ever sees the `source`/`Scry.Core.Query.t()` shapes `Scry.Core.
@@ -75,6 +78,32 @@ a brand-new map built for every single row, real avoidable cost for a
 its many columns. `Scry.Core.Executor` re-applies the query's full
 semantics to whatever comes back regardless, the same safety invariant
 every `fetch` arity here already has.
+
+### `GROUP BY`/aggregate pushdown (`aggregate/5`)
+
+A genuinely stricter contract than `fetch/3`/`fetch/4`'s own lenient
+pushdown -- grouping is irreversible, so a wrong or incomplete pushdown
+can't be corrected downstream the way an over-fetched row set can
+(`Scry.Core.EngineBehaviour.aggregate/5`'s own moduledoc has the full
+reasoning). Three things all have to hold before this issues a native
+`SUM`/`COUNT`/`MIN`/`MAX`/`COUNT(DISTINCT ...)`, or it declines
+gracefully (`:not_supported`, `Scry.Core.Executor` falls back to
+computing it row-by-row, exactly as if this callback didn't exist):
+
+1. Every `GROUP BY`/aggregated column is a safe SQL identifier.
+2. `WHERE` is **fully** translatable -- including a `{:param, name}`
+   bound to a real value -- not just partially, unlike `fetch/3`'s own
+   leniency.
+3. Every aggregated column is schema-level `NOT NULL` (`PRAGMA
+   table_info`, checked in the same transaction as the aggregate query
+   itself). SQL's own aggregates silently skip `NULL` values; Scry's
+   own language spec requires a hard error instead -- this is the one
+   check standing in for that, and the one place this package is
+   schema-aware rather than schema-agnostic.
+
+`avg` is excluded from pushdown eligibility entirely -- SQLite's own
+`AVG()` always returns an inexact float, which would silently break
+Scry's own "exact rationals by default" numeric model.
 
 ## Installation
 

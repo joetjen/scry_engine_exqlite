@@ -31,6 +31,11 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
   own re-verification can never catch, per `Scry.Core.EngineBehaviour`'s
   own safety invariant), and a `{:param, ...}` value isn't available at
   translation time at all (`fetch/3` isn't handed `params`).
+
+  `translate_strict/2` (below) is a separate, stricter entry point for
+  `aggregate/5`'s own pushdown, which *is* handed `params` and *does*
+  need `{:param, ...}` translated -- see its own doc for why its
+  all-or-nothing contract has to differ from this function's leniency.
   """
 
   alias Scry.Core.Query
@@ -52,6 +57,42 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
     |> build_clause()
   end
 
+  @doc """
+  Like `translate/1`, but for `Scry.Engine.Exqlite.aggregate/5`'s own
+  genuinely stricter, all-or-nothing requirement -- grouping is
+  irreversible, so there's no safe way to apply a leftover,
+  untranslated predicate *after* SQL has already aggregated rows away,
+  the way `translate/1`'s own leniency (silently drop what can't be
+  translated, `Scry.Core.Executor` re-checks everything downstream
+  regardless) relies on. Returns `:error` the moment *any* `wheres`
+  predicate can't be translated, rather than silently narrowing.
+
+  Also resolves `{:param, name}` against `bound_params` -- `translate/1`
+  never does this (`fetch/3` isn't handed `params` at all), but
+  `aggregate/5` is, so a query filtering by a runtime-bound value (the
+  overwhelmingly common real case) can still reach 100% translatability
+  instead of declining pushdown outright.
+  """
+  @spec translate_strict([Query.predicate()], map()) :: {:ok, String.t(), [term()]} | :error
+  def translate_strict(wheres, bound_params) do
+    wheres
+    |> Enum.flat_map(&flatten_and/1)
+    |> Enum.reduce_while({:ok, []}, fn predicate, {:ok, acc} ->
+      case translate_leaf_strict(predicate, bound_params) do
+        {:ok, clause} -> {:cont, {:ok, [clause | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, reversed_clauses} ->
+        {where_sql, params} = build_clause(Enum.reverse(reversed_clauses))
+        {:ok, where_sql, params}
+
+      :error ->
+        :error
+    end
+  end
+
   defp flatten_and({:and, left, right}), do: flatten_and(left) ++ flatten_and(right)
   defp flatten_and(predicate), do: [predicate]
 
@@ -66,6 +107,29 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
   end
 
   defp translate_leaf(_predicate), do: []
+
+  defp translate_leaf_strict({:cmp, op, [field], value}, bound_params) do
+    with {:ok, sql_op} <- Map.fetch(@op_sql, op),
+         true <- identifier?(field),
+         {:ok, resolved} <- resolve_strict_value(value, bound_params) do
+      {:ok, {"#{field} #{sql_op} ?", resolved}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp translate_leaf_strict(_predicate, _bound_params), do: :error
+
+  defp resolve_strict_value({:param, name}, bound_params) do
+    case Map.fetch(bound_params, name) do
+      {:ok, value} -> if literal?(value), do: {:ok, value}, else: :error
+      :error -> :error
+    end
+  end
+
+  defp resolve_strict_value(value, _bound_params) do
+    if literal?(value), do: {:ok, value}, else: :error
+  end
 
   defp identifier?(field), do: is_binary(field) and Regex.match?(@identifier, field)
 
