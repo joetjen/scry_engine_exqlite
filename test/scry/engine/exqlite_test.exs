@@ -185,6 +185,38 @@ defmodule Scry.Engine.ExqliteTest do
     end
   end
 
+  describe "execute/3 -- a DateTime literal WHERE against an epoch-microseconds-encoded column" do
+    test "pushes down and narrows correctly, matching the same comparison in Elixir term order",
+         %{
+           db: db
+         } do
+      :ok =
+        Exqlite.Sqlite3.execute(db, """
+        CREATE TABLE events (id INTEGER PRIMARY KEY, logged_at INTEGER NOT NULL)
+        """)
+
+      base = ~U[2026-01-01 00:00:00Z]
+
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(db, "INSERT INTO events VALUES (?, ?)")
+
+      Enum.each([{1, base}, {2, DateTime.add(base, 300, :second)}], fn {id, dt} ->
+        :ok = Exqlite.Sqlite3.bind(stmt, [id, DateTime.to_unix(dt, :microsecond)])
+        :done = Exqlite.Sqlite3.step(db, stmt)
+      end)
+
+      Exqlite.Sqlite3.release(db, stmt)
+
+      query = %Query{
+        source: ["events"],
+        wheres: [{:cmp, :ge, ["logged_at"], DateTime.add(base, 60, :second)}],
+        select: [{:field, ["id"]}]
+      }
+
+      assert {:ok, rows} = materialize(Engine.execute(%Conn{db: db}, query, %{}))
+      assert rows == [%{"id" => 2}]
+    end
+  end
+
   describe "execute/3 -- delegated to Scry.Core.QueryOps.run_document/4" do
     test "a correlated nested SELECT is delegated and produces correct results", %{
       conn: conn,

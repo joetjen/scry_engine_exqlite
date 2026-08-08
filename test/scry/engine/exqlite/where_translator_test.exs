@@ -43,6 +43,18 @@ defmodule Scry.Engine.Exqlite.WhereTranslatorTest do
                {:ok, " WHERE score >= ?", [1.5]}
     end
 
+    test "a DateTime/NaiveDateTime literal translates, bound as its own epoch-microseconds integer" do
+      datetime = ~U[2026-01-01 00:00:00Z]
+      naive = ~N[2026-01-01 00:00:00]
+
+      assert WhereTranslator.translate([{:cmp, :ge, ["timestamp"], datetime}], %{}) ==
+               {:ok, " WHERE timestamp >= ?", [DateTime.to_unix(datetime, :microsecond)]}
+
+      assert WhereTranslator.translate([{:cmp, :ge, ["timestamp"], naive}], %{}) ==
+               {:ok, " WHERE timestamp >= ?",
+                [NaiveDateTime.diff(naive, ~N[1970-01-01 00:00:00], :microsecond)]}
+    end
+
     test "multiple wheres entries are AND-joined, in order" do
       wheres = [{:cmp, :eq, ["status"], "active"}, {:cmp, :gt, ["age"], 18}]
 

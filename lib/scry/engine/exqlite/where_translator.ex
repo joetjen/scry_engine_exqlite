@@ -22,14 +22,28 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
   `op` is one of `:eq`/`:not_eq`/`:lt`/`:gt`/`:le`/`:ge` (`:match` has
   no native SQLite equivalent); and every value involved (a literal, or
   a `{:param, name}` resolved against `params`) is a plain string,
-  integer, or float, **or** the literal `nil` specifically for `:eq`/
-  `:not_eq` -- translated to `IS NULL`/`IS NOT NULL`, not a naive
-  `= ?`/`!= ?` bound to `NULL` (SQL's own `x = NULL` is always `NULL`,
-  never `TRUE`, so a literal translation there would silently change
-  what the clause means). Booleans are deliberately never translated --
-  SQLite has no native boolean type, and guessing whether a column
-  stores `0`/`1` integers or a real `SQLite ≥ 3.23` boolean literal
-  isn't safe to assume.
+  integer, or float, a `DateTime.t()`/`NaiveDateTime.t()` (see below),
+  **or** the literal `nil` specifically for `:eq`/`:not_eq` --
+  translated to `IS NULL`/`IS NOT NULL`, not a naive `= ?`/`!= ?` bound
+  to `NULL` (SQL's own `x = NULL` is always `NULL`, never `TRUE`, so a
+  literal translation there would silently change what the clause
+  means). Booleans are deliberately never translated -- SQLite has no
+  native boolean type, and guessing whether a column stores `0`/`1`
+  integers or a real `SQLite ≥ 3.23` boolean literal isn't safe to
+  assume.
+
+  **A `DateTime.t()`/`NaiveDateTime.t()` literal binds as its own Unix
+  epoch (microseconds) integer**, not an ISO 8601 string -- SQLite has
+  no native timestamp type, so this module has to pick *some* concrete
+  on-the-wire representation, and an integer sorts correctly under
+  ordinary numeric comparison with no format/padding/timezone
+  assumptions an ISO 8601 string comparison would otherwise carry. A
+  column being compared against one **must itself be stored as the
+  same epoch-microseconds integer**, or the comparison is comparing two
+  genuinely different things; `Scry.Engine.Exqlite.SqlCompiler`'s own
+  type-affinity check (`:numeric`, the same class a plain integer/float
+  literal gets) is exactly what catches a column that isn't, declining
+  the comparison rather than risk a silently wrong result.
   """
 
   alias Scry.Core.Query
@@ -154,16 +168,30 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
 
   defp resolve_value({:param, name}, params) do
     case Map.fetch(params, name) do
-      {:ok, value} -> if literal?(value), do: {:ok, value}, else: :error
+      {:ok, value} -> bind_value(value)
       :error -> :error
     end
   end
 
-  defp resolve_value(value, _params), do: if(literal?(value), do: {:ok, value}, else: :error)
+  defp resolve_value(value, _params), do: bind_value(value)
 
   @doc "Whether `field` is a safe-to-interpolate SQL identifier -- also used by `Scry.Engine.Exqlite.SqlCompiler`."
   @spec identifier?(term()) :: boolean()
   def identifier?(field), do: is_binary(field) and Regex.match?(@identifier, field)
 
-  defp literal?(value), do: is_binary(value) or is_integer(value) or is_float(value)
+  # The epoch (microseconds) `%DateTime{}`/`%NaiveDateTime{}` encoding
+  # this module's own moduledoc documents -- also reused by `Scry.
+  # Engine.Exqlite.SqlCompiler`'s own type-affinity classification, so
+  # both sides of "how is a DateTime literal represented on the wire"
+  # stay in exactly one place.
+  @spec bind_value(term()) :: {:ok, String.t() | integer() | float()} | :error
+  def bind_value(%DateTime{} = value), do: {:ok, DateTime.to_unix(value, :microsecond)}
+
+  def bind_value(%NaiveDateTime{} = value),
+    do: {:ok, NaiveDateTime.diff(value, ~N[1970-01-01 00:00:00], :microsecond)}
+
+  def bind_value(value) when is_binary(value) or is_integer(value) or is_float(value),
+    do: {:ok, value}
+
+  def bind_value(_value), do: :error
 end

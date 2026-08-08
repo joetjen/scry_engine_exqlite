@@ -411,6 +411,15 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
 
   defp value_type_class(v) when is_binary(v), do: :text
   defp value_type_class(v) when is_number(v), do: :numeric
+
+  # A DateTime/NaiveDateTime literal binds as its own epoch-microseconds
+  # integer (`WhereTranslator.bind_value/1`'s own moduledoc has the full
+  # reasoning) -- `:numeric` is the class that actually matches what
+  # goes over the wire, not `nil` (which would skip the type-affinity
+  # check for it entirely and let it silently compare against a
+  # mismatched column).
+  defp value_type_class(%DateTime{}), do: :numeric
+  defp value_type_class(%NaiveDateTime{}), do: :numeric
   defp value_type_class(_v), do: nil
 
   # ---- identifier quoting for output aliases -------------------------------
