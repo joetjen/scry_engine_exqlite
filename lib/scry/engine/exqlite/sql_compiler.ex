@@ -79,21 +79,27 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
 
   ## A second correctness subtlety, found by property testing, not assumed
 
-  `<`/`>`/`<=`/`>=` order values *differently* in SQLite than in
-  `Scry.Core.QueryOps.term_order/2` when a column's own declared type
-  doesn't match the compared literal's type -- confirmed directly: a
-  `TEXT`-affinity column compared against an integer literal via `<`
-  can disagree between the two (SQLite's own type-affinity rules
-  govern the comparison, not Erlang's total term order, which always
-  sorts a number below any binary/string). `:eq`/`:not_eq` don't have
-  this problem (both systems already agree a string and a number are
-  never equal), so `compile/2` also returns `type_checks` -- one
-  `{column, :numeric | :text}` pair per *ordering* comparison's own
-  field, the type inferred from the compared literal -- for `Scry.
+  Every comparison operator -- not just `<`/`>`/`<=`/`>=`, `=`/`!=`
+  too -- can disagree between SQLite and `Scry.Core.QueryOps.
+  term_order/2`/`Kernel.==/2` when a column's own declared type
+  doesn't match the compared literal's type. Confirmed directly, twice
+  over, by property testing: a `TEXT`-affinity column compared against
+  an integer literal via `<` can disagree (SQLite's own type-affinity
+  rules govern the comparison, not Erlang's total term order, which
+  always sorts a number below any binary/string) -- and, found
+  *after* first assuming `=`/`!=` were safe from this (they are not),
+  an `INTEGER`-affinity column compared against the *string* literal
+  `"2"` via `=` genuinely matches the integer `2` in SQLite (its own
+  documented affinity-coercion rule applies to every comparison
+  operator alike, not only the ordering ones), where the interpreter's
+  own `=` never considers a string and a number equal. `compile/2`
+  therefore also returns `type_checks` -- one `{column, :numeric |
+  :text}` pair per **every** comparison's own field, not just ordering
+  ones, the type inferred from the compared literal -- for `Scry.
   Engine.Exqlite.execute/3` to verify against the column's own real
   SQLite type affinity (the same `PRAGMA table_info` pass the `NOT
   NULL` check already makes) before trusting the compiled SQL's
-  ordering to agree with the interpreter's own.
+  comparison to agree with the interpreter's own.
   """
 
   alias Scry.Core.Query
@@ -376,19 +382,41 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
 
   # ---- ordering type-affinity checks (WHERE side) -------------------------
 
-  # Only `<`/`>`/`<=`/`>=` need this -- `=`/`!=` already agree between
-  # SQLite and `Scry.Core.QueryOps.term_order/2` for a genuinely
-  # mismatched type (neither ever considers a string and a number
-  # equal), confirmed directly, not assumed from the ordering-operator
-  # finding alone.
+  # Every comparison operator needs this, not just the ordering ones
+  # -- found the hard way, twice: `<`/`>`/`<=`/`>=` disagree between
+  # SQLite and `Scry.Core.QueryOps.term_order/2` for a mismatched type
+  # (assumed, confirmed by property testing), and `=`/`!=` were then
+  # *assumed* safe from the same problem ("neither system considers a
+  # string and a number equal") -- also disproven by property testing:
+  # SQLite's own affinity-coercion rule applies to every comparison
+  # operator alike, so an `INTEGER`-affinity column can genuinely `= "2"`
+  # (the string) in SQLite while the interpreter's own `=` never
+  # considers them equal. `field = nil`/`field != nil` (the null-check
+  # idiom, translated to `IS NULL`/`IS NOT NULL`, no literal comparison
+  # at all) never needs this -- `value_type_class(nil)`'s own catch-all
+  # already returns `nil`, excluding it with no special case required.
   defp type_checks_from_where(wheres, params),
     do: wheres |> Enum.flat_map(&collect_type_check(&1, params)) |> Enum.uniq()
 
-  defp collect_type_check({:cmp, op, [field], value}, params) when op in [:lt, :gt, :le, :ge] do
+  defp collect_type_check({:cmp, _op, [field], value}, params) do
     case resolve_type_class(value, params) do
       nil -> []
       class -> [{field, class}]
     end
+  end
+
+  # `field IN (v1, v2, ...)` is equivalent to `field = v1 OR field = v2
+  # OR ...` -- the identical affinity-coercion risk applies per value.
+  # A mixed-type list (e.g. `IN (1, "x")`) collects more than one class
+  # for the same field, which `verify_schema/3`'s own `Enum.all?` check
+  # can never simultaneously satisfy -- declines safely rather than
+  # risk trusting a comparison against whichever type happens to match
+  # the column's own affinity.
+  defp collect_type_check({:in, [field], values}, params) when is_list(values) do
+    values
+    |> Enum.map(&resolve_type_class(&1, params))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&{field, &1})
   end
 
   defp collect_type_check({:and, l, r}, params),

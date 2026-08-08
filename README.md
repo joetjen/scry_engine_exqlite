@@ -71,14 +71,16 @@ schema row) or the whole query is declined with `{:error, {:unsupported,
 {:nullable_column, columns}}}`.
 
 Found by property testing, not assumed: SQLite's type-affinity-based
-comparison rules can disagree with this project's own Erlang-term-order
-comparison semantics for `<`/`>`/`<=`/`>=` across mismatched column/
-literal types (e.g. a `TEXT` column compared against an integer
-literal) — every ordering comparison's column is additionally checked
-against its own real SQLite type affinity (the same 5-rule algorithm
-SQLite itself uses), declining with `{:error, {:unsupported,
-{:type_mismatch, checks}}}` rather than risk a silently wrong ordering
-result.
+comparison rules can disagree with this project's own Erlang-term-order/
+`Kernel.==/2` comparison semantics across mismatched column/literal
+types (e.g. a `TEXT` column compared against an integer literal via
+`<`, or — found after first assuming equality was safe from this —
+an `INTEGER` column genuinely `= "2"` the string in SQLite thanks to
+its own affinity-coercion rule) — every comparison's own column,
+`=`/`!=`/`IN` included, not just ordering, is checked against its own
+real SQLite type affinity (the same 5-rule algorithm SQLite itself
+uses), declining with `{:error, {:unsupported, {:type_mismatch,
+checks}}}` rather than risk a silently wrong result.
 
 `avg` is pushdown-eligible and returns a native, inexact SQL float —
 `scry_core`'s own `CHANGELOG.md` has the full reasoning for relaxing

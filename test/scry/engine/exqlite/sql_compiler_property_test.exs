@@ -9,13 +9,16 @@ defmodule Scry.Engine.Exqlite.SqlCompilerPropertyTest do
   QueryOps.run_flat/3` directly over the same rows -- the direct
   replacement for the automatic re-verification the old, lenient
   `fetch/3` contract used to provide for free, now this engine's own
-  responsibility to prove.
+  responsibility to prove. `execute/3`'s own rows come back as `Scry.
+  Core.Row.t()` values for this direct pushdown path; normalized via
+  `Row.to_map/1` before comparing against `run_flat/3`'s own plain-map
+  output.
   """
 
   use ExUnit.Case, async: false
   use ExUnitProperties
 
-  alias Scry.Core.{Query, QueryOps}
+  alias Scry.Core.{Query, QueryOps, Row}
   alias Scry.Engine.Exqlite, as: Engine
   alias Scry.Engine.Exqlite.Conn
 
@@ -103,7 +106,7 @@ defmodule Scry.Engine.Exqlite.SqlCompilerPropertyTest do
 
       via_engine =
         case Engine.execute(%Conn{db: db}, query, %{}) do
-          {:ok, sql_rows} -> {:ok, Enum.to_list(sql_rows)}
+          {:ok, sql_rows} -> {:ok, sql_rows |> Enum.to_list() |> Enum.map(&Row.to_map/1)}
           {:error, {:unsupported, _}} -> :declined
         end
 

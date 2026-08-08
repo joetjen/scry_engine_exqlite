@@ -24,7 +24,7 @@ defmodule Scry.Engine.Exqlite.AggregateTest do
 
   use ExUnit.Case, async: true
 
-  alias Scry.Core.{Cursor, Executor, Query}
+  alias Scry.Core.{Cursor, Executor, Query, Row}
   alias Scry.Engine.Exqlite, as: Engine
   alias Scry.Engine.Exqlite.Conn
 
@@ -73,12 +73,35 @@ defmodule Scry.Engine.Exqlite.AggregateTest do
     Exqlite.Sqlite3.release(db, stmt)
   end
 
-  defp materialize({:ok, cursor}), do: {:ok, Cursor.to_list(cursor)}
+  defp materialize({:ok, cursor}), do: {:ok, cursor |> Cursor.to_list() |> Enum.map(&to_plain/1)}
   defp materialize({:error, _} = err), do: err
+
+  defp to_plain(%Row{} = row), do: Row.to_map(row)
+  defp to_plain(row), do: row
 
   defp run(query, conn), do: query |> Executor.run(Engine, conn) |> materialize()
 
   describe "GROUP BY + aggregate pushdown, over NOT NULL columns" do
+    test "rows genuinely come back as Scry.Core.Row values, not plain maps", %{conn: conn} do
+      query = %Query{
+        source: ["orders"],
+        group_bys: [["user_id"]],
+        select: [
+          {:field, ["user_id"]},
+          {:computed, "total", {:call, "sum", [{:field, ["amount"]}]}}
+        ]
+      }
+
+      assert {:ok, cursor} = Executor.run(query, Engine, conn)
+      rows = Cursor.to_list(cursor)
+      assert Enum.all?(rows, &match?(%Row{}, &1))
+
+      assert Enum.map(rows, &Row.to_map/1) |> Enum.sort_by(& &1["user_id"]) == [
+               %{"user_id" => 1, "total" => 30},
+               %{"user_id" => 2, "total" => 12}
+             ]
+    end
+
     test "sum/count/min/max all push down and produce correct results", %{conn: conn} do
       query = %Query{
         source: ["orders"],

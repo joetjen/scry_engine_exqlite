@@ -23,6 +23,30 @@ defmodule Scry.Engine.Exqlite do
   needs (relaxing exactness never meant relaxing "no silent
   null-skipping" too -- those are separate concerns).
 
+  **Rows come back as `Scry.Core.Row.t()` values, not plain maps**,
+  for this direct, wholly-pushed-down path (a nested/correlated
+  `SELECT`/`WITH`-bound source still returns plain maps -- delegated to
+  `Scry.Core.QueryOps.run_document/4`, whose own final projection step
+  always builds one). Building a brand-new string-keyed map for every
+  single row is real, measured cost at scale that a caller who doesn't
+  need every field of every row (counting, pagination, streaming a
+  handful of fields onward) shouldn't have to pay for -- `Scry.Core.
+  Row`'s own moduledoc has the full reasoning. A caller wanting a
+  plain map calls `Scry.Core.Row.to_map/1`; `Scry.Core.QueryOps` itself
+  already treats a `Row` as a first-class row shape throughout.
+
+  **The schema check itself is cached per `Scry.Engine.Exqlite.Conn`**,
+  not re-run from scratch on every single call -- a real, measured cost
+  for a small/point-lookup query, where the check's own `PRAGMA
+  table_info` round trip dwarfed the actual query. Verified cheaply via
+  SQLite's own `PRAGMA schema_version` (a single integer, bumped by any
+  schema-altering statement against the database file, from any
+  connection) before trusting a cached `table_info` result -- so a real
+  schema change is still detected, not silently missed; `Scry.Engine.
+  Exqlite.Conn`'s own moduledoc has the full mechanics. A `%Conn{}`
+  built by hand rather than via `Conn.open/2` has no cache and simply
+  re-checks every time -- always correct, just not optimized.
+
   A query `SqlCompiler` declines (a window function, `ROLLUP`/`CUBE`,
   a real `HAVING` clause, `json(...)`/other casts or arithmetic in
   `select`, a `WHERE` predicate wider than it translates) is a real,
@@ -58,7 +82,7 @@ defmodule Scry.Engine.Exqlite do
 
   @behaviour Scry.Core.EngineBehaviour
 
-  alias Scry.Core.{CombinedQuery, Query, QueryOps}
+  alias Scry.Core.{CombinedQuery, Query, QueryOps, Row}
   alias Scry.Engine.Exqlite.{Conn, SqlCompiler}
 
   @default_chunk_size 2_000
@@ -77,7 +101,7 @@ defmodule Scry.Engine.Exqlite do
 
         {:ok, compiled} ->
           [table] = source
-          run_sql_with_schema_check(db, table, compiled)
+          run_sql_with_schema_check(conn, table, compiled)
 
         {:error, _} = error ->
           error
@@ -94,26 +118,26 @@ defmodule Scry.Engine.Exqlite do
     with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, sql),
          :ok <- Exqlite.Sqlite3.bind(stmt, bind_params),
          {:ok, raw_columns} <- Exqlite.Sqlite3.columns(db, stmt) do
-      columns = Enum.map(raw_columns, &to_string/1)
-      {:ok, rows_stream(db, stmt, columns)}
+      index = raw_columns |> Enum.map(&to_string/1) |> Row.build_index()
+      {:ok, rows_stream(db, stmt, index)}
     else
       {:error, reason} -> {:error, {:query_error, reason}}
     end
   end
 
   # `Scry.Engine.Exqlite.SqlCompiler`'s own moduledoc has the full
-  # reasoning for both checks this makes: `PRAGMA table_info` and the
+  # reasoning for both checks this makes: the schema check and the
   # compiled query itself run inside one transaction, so a schema
   # change on another connection between an isolated check and the
   # query can't let a real `NULL` (or a type-affinity mismatch)
   # slip through none of Scry's own guarantees would have caught.
   # Always `COMMIT`, never `ROLLBACK` -- read-only for its entire
   # duration, nothing to undo either way.
-  defp run_sql_with_schema_check(db, table, compiled) do
+  defp run_sql_with_schema_check(%Conn{db: db} = conn, table, compiled) do
     case Exqlite.Sqlite3.execute(db, "BEGIN DEFERRED") do
       :ok ->
         result =
-          case schema_check(db, table, compiled.not_null_columns, compiled.type_checks) do
+          case schema_check(conn, table, compiled.not_null_columns, compiled.type_checks) do
             :ok -> run_sql_eager(db, compiled)
             {:error, _} = error -> error
           end
@@ -136,18 +160,64 @@ defmodule Scry.Engine.Exqlite do
          {:ok, raw_columns} <- Exqlite.Sqlite3.columns(db, stmt),
          {:ok, rows} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
       Exqlite.Sqlite3.release(db, stmt)
-      columns = Enum.map(raw_columns, &to_string/1)
-      {:ok, Enum.map(rows, &row_map(columns, &1))}
+      index = raw_columns |> Enum.map(&to_string/1) |> Row.build_index()
+      {:ok, Enum.map(rows, &Row.new(index, &1))}
     else
       {:error, reason} -> {:error, {:query_error, reason}}
     end
   end
 
-  defp schema_check(db, table, not_null_columns, type_checks) do
+  defp schema_check(%Conn{db: db, schema_cache: nil}, table, not_null_columns, type_checks) do
+    with {:ok, rows} <- fetch_table_info(db, table) do
+      verify_schema(rows, not_null_columns, type_checks)
+    end
+  end
+
+  defp schema_check(%Conn{db: db, schema_cache: cache}, table, not_null_columns, type_checks) do
+    with {:ok, rows} <- cached_table_info(db, cache, table) do
+      verify_schema(rows, not_null_columns, type_checks)
+    end
+  end
+
+  # `PRAGMA table_info` is re-fetched only when SQLite's own `PRAGMA
+  # schema_version` (a single, cheap integer read -- bumped by *any*
+  # schema-altering statement against this database file, from any
+  # connection, not just this one) disagrees with what's cached. Both
+  # still run inside the same transaction `run_sql_with_schema_check/3`
+  # already opened, so a schema change between the version check and
+  # the compiled query itself is still caught, exactly as if caching
+  # didn't exist -- this only ever skips the (comparatively expensive)
+  # `table_info` round trip, never the freshness guarantee itself.
+  defp cached_table_info(db, cache, table) do
+    with {:ok, version} <- schema_version(db) do
+      case :ets.lookup(cache, table) do
+        [{^table, ^version, rows}] ->
+          {:ok, rows}
+
+        _stale_or_missing ->
+          with {:ok, rows} <- fetch_table_info(db, table) do
+            :ets.insert(cache, {table, version, rows})
+            {:ok, rows}
+          end
+      end
+    end
+  end
+
+  defp schema_version(db) do
+    with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, "PRAGMA schema_version"),
+         {:ok, [[version]]} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
+      Exqlite.Sqlite3.release(db, stmt)
+      {:ok, version}
+    else
+      {:error, reason} -> {:error, {:query_error, reason}}
+    end
+  end
+
+  defp fetch_table_info(db, table) do
     with {:ok, stmt} <- Exqlite.Sqlite3.prepare(db, "PRAGMA table_info(#{table})"),
          {:ok, rows} <- Exqlite.Sqlite3.fetch_all(db, stmt) do
       Exqlite.Sqlite3.release(db, stmt)
-      verify_schema(rows, not_null_columns, type_checks)
+      {:ok, rows}
     else
       {:error, reason} -> {:error, {:query_error, reason}}
     end
@@ -232,7 +302,7 @@ defmodule Scry.Engine.Exqlite do
     end
   end
 
-  defp rows_stream(db, stmt, columns) do
+  defp rows_stream(db, stmt, index) do
     Stream.resource(
       fn -> :more end,
       fn
@@ -241,8 +311,8 @@ defmodule Scry.Engine.Exqlite do
 
         :more ->
           case Exqlite.Sqlite3.multi_step(db, stmt, chunk_size()) do
-            {:rows, rows} -> {Enum.map(rows, &row_map(columns, &1)), :more}
-            {:done, rows} -> {Enum.map(rows, &row_map(columns, &1)), :done}
+            {:rows, rows} -> {Enum.map(rows, &Row.new(index, &1)), :more}
+            {:done, rows} -> {Enum.map(rows, &Row.new(index, &1)), :done}
           end
       end,
       fn _state -> Exqlite.Sqlite3.release(db, stmt) end
@@ -253,6 +323,4 @@ defmodule Scry.Engine.Exqlite do
   # tests force the multi-chunk accumulation path without needing
   # thousands of rows to exceed the real-world default.
   defp chunk_size, do: Application.get_env(:scry_engine_exqlite, :chunk_size, @default_chunk_size)
-
-  defp row_map(columns, values), do: columns |> Enum.zip(values) |> Map.new()
 end

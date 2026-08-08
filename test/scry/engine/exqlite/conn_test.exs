@@ -28,12 +28,24 @@ defmodule Scry.Engine.Exqlite.ConnTest do
     assert File.exists?(path)
   end
 
+  test "open/2 also creates a schema cache, used to avoid a fresh PRAGMA table_info on every call",
+       %{path: path} do
+    assert {:ok, %Conn{schema_cache: schema_cache}} = Conn.open(path)
+    assert :ets.info(schema_cache) != :undefined
+  end
+
   test "open/2 passes through an error unchanged", %{path: path} do
     assert {:error, _reason} = Conn.open(path, mode: :readonly)
   end
 
-  test "close/1 releases the connection", %{path: path} do
-    assert {:ok, conn} = Conn.open(path)
+  test "close/1 releases the connection and its schema cache", %{path: path} do
+    assert {:ok, %Conn{schema_cache: schema_cache} = conn} = Conn.open(path)
     assert Conn.close(conn) == :ok
+    assert :ets.info(schema_cache) == :undefined
+  end
+
+  test "a hand-built %Conn{db: db} (no schema_cache) still closes fine", %{path: path} do
+    {:ok, %Conn{db: db}} = Conn.open(path)
+    assert Conn.close(%Conn{db: db}) == :ok
   end
 end

@@ -17,11 +17,18 @@ defmodule Scry.Engine.ExqliteTest do
   whole to `Scry.Core.QueryOps.run_document/4` rather than attempted
   natively -- all composing correctly end to end through a real
   `Scry.Core.Executor.run/4` call.
+
+  Rows come back as `Scry.Core.Row.t()` values for this module's own
+  direct (non-delegated) path -- `materialize/1` below converts every
+  row to a plain map via `Scry.Core.Row.to_map/1` so the rest of this
+  suite can keep asserting on ordinary `%{...}` shapes without needing
+  to care; "rows are genuinely Row, not just plain maps" gets its own
+  explicit, dedicated test instead of being implicit everywhere.
   """
 
   use ExUnit.Case, async: true
 
-  alias Scry.Core.{Cursor, Executor, Query}
+  alias Scry.Core.{Cursor, Executor, Query, Row}
   alias Scry.Engine.Exqlite, as: Engine
   alias Scry.Engine.Exqlite.Conn
 
@@ -64,10 +71,27 @@ defmodule Scry.Engine.ExqliteTest do
     Exqlite.Sqlite3.release(db, stmt)
   end
 
-  defp materialize({:ok, rows}), do: {:ok, Enum.to_list(rows)}
+  defp materialize({:ok, rows}), do: {:ok, rows |> Enum.to_list() |> Enum.map(&to_plain/1)}
   defp materialize(other), do: other
 
+  defp to_plain(%Row{} = row), do: Row.to_map(row)
+  defp to_plain(row), do: row
+
   describe "execute/3 -- plain queries" do
+    test "rows genuinely come back as Scry.Core.Row values, not plain maps, for this direct pushdown path",
+         %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        wheres: [{:cmp, :eq, ["id"], 1}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:ok, rows} = Engine.execute(conn, query, %{})
+      assert [%Row{} = row] = Enum.to_list(rows)
+      assert Row.fetch!(row, "name") == "Alice"
+      assert Row.to_map(row) == %{"name" => "Alice"}
+    end
+
     test "no wheres at all returns every row", %{conn: conn} do
       query = %Query{source: ["users"], select: [{:field, ["id"]}, {:field, ["name"]}]}
 
@@ -185,6 +209,121 @@ defmodule Scry.Engine.ExqliteTest do
     end
   end
 
+  describe "a type-affinity mismatch declines rather than risk a wrong result" do
+    test "an ordering comparison against a mismatched-affinity literal declines", %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        wheres: [{:cmp, :gt, ["age"], "not a number"}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:error, {:unsupported, {:type_mismatch, _}}} = Engine.execute(conn, query, %{})
+    end
+
+    test "an equality comparison against a mismatched-affinity literal also declines -- found by property testing, not assumed",
+         %{conn: conn} do
+      # `age` is INTEGER; SQLite's own affinity-coercion rule (applies
+      # to every comparison operator, `=` included -- confirmed
+      # directly, not assumed from the ordering-operator case alone)
+      # would otherwise treat `age = "30"` as true for the row where
+      # age is the integer 30, while the interpreter's own `=` never
+      # considers a string and a number equal.
+      query = %Query{
+        source: ["users"],
+        wheres: [{:cmp, :eq, ["age"], "30"}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:error, {:unsupported, {:type_mismatch, _}}} = Engine.execute(conn, query, %{})
+    end
+
+    test "an IN list mixing types against one field declines", %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        wheres: [{:in, ["age"], [30, "thirty"]}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:error, {:unsupported, {:type_mismatch, _}}} = Engine.execute(conn, query, %{})
+    end
+  end
+
+  describe "the schema check is cached per Conn, but a real schema change is still detected" do
+    test "repeated queries against the same table reuse one cache entry, not a fresh table_info per call" do
+      path = Path.join(System.tmp_dir!(), "cache_reuse_#{System.unique_integer([:positive])}.db")
+      File.rm(path)
+      {:ok, conn} = Conn.open(path)
+
+      :ok =
+        Exqlite.Sqlite3.execute(conn.db, """
+        CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER NOT NULL)
+        """)
+
+      query = %Query{
+        source: ["users"],
+        wheres: [{:cmp, :gt, ["age"], 0}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:ok, []} = materialize(Engine.execute(conn, query, %{}))
+      assert :ets.info(conn.schema_cache, :size) == 1
+
+      assert {:ok, []} = materialize(Engine.execute(conn, query, %{}))
+      # Still exactly one entry -- the second call reused it rather
+      # than inserting a duplicate or bypassing the cache.
+      assert :ets.info(conn.schema_cache, :size) == 1
+
+      Conn.close(conn)
+      File.rm(path)
+    end
+
+    test "caching never lets a stale NOT NULL check through" do
+      path = Path.join(System.tmp_dir!(), "schema_cache_#{System.unique_integer([:positive])}.db")
+      File.rm(path)
+      {:ok, conn} = Conn.open(path)
+
+      :ok =
+        Exqlite.Sqlite3.execute(conn.db, """
+        CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT)
+        """)
+
+      {:ok, stmt} = Exqlite.Sqlite3.prepare(conn.db, "INSERT INTO widgets VALUES (?, ?, ?)")
+      :ok = Exqlite.Sqlite3.bind(stmt, [1, "sprocket", "active"])
+      :done = Exqlite.Sqlite3.step(conn.db, stmt)
+      Exqlite.Sqlite3.release(conn.db, stmt)
+
+      query = %Query{
+        source: ["widgets"],
+        wheres: [{:cmp, :eq, ["status"], "active"}],
+        select: [{:field, ["name"]}]
+      }
+
+      # `status` starts nullable -- declines, and populates the cache
+      # with that schema.
+      assert Engine.execute(conn, query, %{}) ==
+               {:error, {:unsupported, {:nullable_column, ["status"]}}}
+
+      # A real schema change: SQLite has no direct "make a column NOT
+      # NULL" statement, so this is the standard rebuild idiom --
+      # bumps `PRAGMA schema_version` regardless.
+      :ok =
+        Exqlite.Sqlite3.execute(conn.db, """
+        CREATE TABLE widgets_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL)
+        """)
+
+      :ok = Exqlite.Sqlite3.execute(conn.db, "INSERT INTO widgets_new SELECT * FROM widgets")
+      :ok = Exqlite.Sqlite3.execute(conn.db, "DROP TABLE widgets")
+      :ok = Exqlite.Sqlite3.execute(conn.db, "ALTER TABLE widgets_new RENAME TO widgets")
+
+      # Same conn, same schema_cache -- must genuinely re-check, not
+      # trust the stale "status is nullable" result forever.
+      assert {:ok, [%{"name" => "sprocket"}]} = materialize(Engine.execute(conn, query, %{}))
+
+      Conn.close(conn)
+      File.rm(path)
+    end
+  end
+
   describe "execute/3 -- a DateTime literal WHERE against an epoch-microseconds-encoded column" do
     test "pushes down and narrows correctly, matching the same comparison in Elixir term order",
          %{
@@ -284,7 +423,7 @@ defmodule Scry.Engine.ExqliteTest do
       }
 
       assert {:ok, cursor} = Executor.run(query, Engine, conn)
-      assert Cursor.to_list(cursor) == [%{"name" => "Alice"}]
+      assert cursor |> Cursor.to_list() |> Enum.map(&to_plain/1) == [%{"name" => "Alice"}]
     end
 
     test "GROUP BY + count executes correctly via native SQL pushdown", %{conn: conn} do
@@ -299,7 +438,7 @@ defmodule Scry.Engine.ExqliteTest do
 
       assert {:ok, cursor} = Executor.run(query, Engine, conn)
 
-      assert Cursor.to_list(cursor) |> Enum.sort_by(& &1["age"]) == [
+      assert cursor |> Cursor.to_list() |> Enum.map(&to_plain/1) |> Enum.sort_by(& &1["age"]) == [
                %{"age" => 17, "n" => 1},
                %{"age" => 30, "n" => 1}
              ]
