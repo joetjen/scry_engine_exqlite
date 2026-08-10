@@ -100,7 +100,12 @@ defmodule Scry.Engine.Exqlite.SqlCompilerPropertyTest do
       query = %Query{
         source: ["items"],
         wheres: [predicate],
-        order_bys: [{["id"], :asc}],
+        # `{:field, ["id"]}` is the current `expr()`-tagged sort-key
+        # shape a real parsed query now produces (scry_core's EP1(e)
+        # `ORDER BY` widening) -- the older bare-list shape (`["id"]`)
+        # is exercised separately, directly against `SqlCompiler`, in
+        # `Scry.Engine.ExqliteTest`.
+        order_bys: [{{:field, ["id"]}, :asc}],
         select: [{:field, ["a"]}, {:field, ["b"]}]
       }
 

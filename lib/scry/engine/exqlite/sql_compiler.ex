@@ -31,7 +31,16 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
     (`count(distinct field)` included); `havings == []` (a real
     `HAVING` clause is a genuinely separate translation problem,
     deferred, not attempted this increment).
-  - `order_bys`: every entry a bare, single-segment field.
+  - `order_bys`: every entry's own sort key must be a bare,
+    single-segment field -- either the pre-EP1(e) bare-list shape
+    (`["column"]`, still built directly by some callers, e.g. a
+    hand-constructed `%Query{}`) or the current `expr()`-tagged shape
+    `{:field, ["column"]}` (`Scry.Core.Query`'s own grammar now widens
+    `ORDER BY`'s key to any `expr()`, so a real parsed query always
+    arrives this way) -- anything else (a multi-segment field, a
+    `{:call, ...}`, arithmetic, ...) has no translation here and
+    declines the whole query, same "no partial statement" rule as
+    `select`.
   - `distinct`/`limit`/`offset`: always compile directly (`limit`/
     `offset` are already validated `non_neg_integer() | nil` by
     `Scry.Core.Query.t()`'s own type, never externally-controlled
@@ -350,15 +359,30 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
     end
   end
 
-  defp order_by_item([field], direction) when direction in [:asc, :desc] do
+  defp order_by_item([field], direction) when direction in [:asc, :desc],
+    do: order_by_field(field, direction)
+
+  # `Scry.Core.Query`'s own grammar now widens `ORDER BY`'s sort key to
+  # any `expr()` (EP1(e), for things like `ORDER BY relevance() DESC`
+  # or `ORDER BY price * quantity DESC`, neither of which this compiler
+  # can translate) -- a real parsed query's bare-field case always
+  # arrives wrapped this way, `{:field, [column]}`, not as the old bare
+  # list directly. Unwrap that one common-case shape back to the plain
+  # column the bare-list clause above already validates; anything else
+  # tagged (`{:call, ...}`, `{:arith, ...}`, a multi-segment field, ...)
+  # still correctly falls through to the catch-all below and declines.
+  defp order_by_item({:field, [field]}, direction) when direction in [:asc, :desc],
+    do: order_by_field(field, direction)
+
+  defp order_by_item(_path, _direction), do: :error
+
+  defp order_by_field(field, direction) do
     if WhereTranslator.identifier?(field) do
       {:ok, "#{field} #{if direction == :asc, do: "ASC", else: "DESC"}"}
     else
       :error
     end
   end
-
-  defp order_by_item(_path, _direction), do: :error
 
   defp limit_offset_clause(nil, nil), do: ""
   defp limit_offset_clause(limit, nil) when is_integer(limit), do: " LIMIT #{limit}"

@@ -148,7 +148,8 @@ defmodule Scry.Engine.ExqliteTest do
       assert {:ok, [%{"name" => "Bob"}]} = materialize(Engine.execute(conn, query, %{}))
     end
 
-    test "ORDER BY + LIMIT + OFFSET compiles and executes correctly", %{conn: conn} do
+    test "ORDER BY + LIMIT + OFFSET compiles and executes correctly (bare-list sort key, still accepted for backward compatibility)",
+         %{conn: conn} do
       query = %Query{
         source: ["users"],
         order_bys: [{["age"], :asc}],
@@ -158,6 +159,40 @@ defmodule Scry.Engine.ExqliteTest do
       }
 
       assert {:ok, [%{"name" => "Alice"}]} = materialize(Engine.execute(conn, query, %{}))
+    end
+
+    test "ORDER BY compiles and executes correctly with the current {:field, [column]}-tagged sort key -- what a real parsed query now produces (scry_core's EP1(e) ORDER BY widening)",
+         %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        order_bys: [{{:field, ["age"]}, :asc}],
+        limit: 1,
+        offset: 1,
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:ok, [%{"name" => "Alice"}]} = materialize(Engine.execute(conn, query, %{}))
+    end
+
+    test "ORDER BY on a multi-segment field key declines rather than mistranslate", %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        order_bys: [{{:field, ["users", "age"]}, :asc}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:error, {:unsupported, {:order_by, _}}} = Engine.execute(conn, query, %{})
+    end
+
+    test "ORDER BY on a call (e.g. a future relevance()-style key) declines -- no expression translation here",
+         %{conn: conn} do
+      query = %Query{
+        source: ["users"],
+        order_bys: [{{:call, "relevance", []}, :desc}],
+        select: [{:field, ["name"]}]
+      }
+
+      assert {:error, {:unsupported, {:order_by, _}}} = Engine.execute(conn, query, %{})
     end
 
     test "DISTINCT compiles and executes correctly", %{conn: conn} do
