@@ -94,7 +94,7 @@ exactly like every other aggregate's.
 ```elixir
 def deps do
   [
-    {:scry_engine_exqlite, "~> 1.0"}
+    {:scry_engine_exqlite, "~> 2.0"}
   ]
 end
 ```
