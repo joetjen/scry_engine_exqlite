@@ -179,11 +179,14 @@ defmodule Scry.Engine.Exqlite.WhereTranslator do
   @spec identifier?(term()) :: boolean()
   def identifier?(field), do: is_binary(field) and Regex.match?(@identifier, field)
 
-  # The epoch (microseconds) `%DateTime{}`/`%NaiveDateTime{}` encoding
-  # this module's own moduledoc documents -- also reused by `Scry.
-  # Engine.Exqlite.SqlCompiler`'s own type-affinity classification, so
-  # both sides of "how is a DateTime literal represented on the wire"
-  # stay in exactly one place.
+  @doc """
+  `{:ok, bound_value}` for a value with a direct SQLite bind-parameter
+  translation, `:error` otherwise. The epoch (microseconds)
+  `%DateTime{}`/`%NaiveDateTime{}` encoding this module's own moduledoc
+  documents -- also reused by `Scry.Engine.Exqlite.SqlCompiler`'s own
+  type-affinity classification, so both sides of "how is a DateTime
+  literal represented on the wire" stay in exactly one place.
+  """
   @spec bind_value(term()) :: {:ok, String.t() | integer() | float()} | :error
   def bind_value(%DateTime{} = value), do: {:ok, DateTime.to_unix(value, :microsecond)}
 

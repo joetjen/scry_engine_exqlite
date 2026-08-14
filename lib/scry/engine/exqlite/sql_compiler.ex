@@ -125,6 +125,12 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
           type_checks: [{String.t(), :numeric | :text}]
         }
 
+  @doc """
+  Compiles `query` (with `params` resolving any `{:param, name}`
+  placeholder) into a single native SQL statement, all-or-nothing --
+  this module's own moduledoc has the complete "what compiles" and
+  `not_null_columns`/`type_checks` reasoning.
+  """
   @spec compile(Query.t(), map()) :: {:ok, compiled()} | {:error, {:unsupported, term()}}
   def compile(%Query{} = query, params) do
     with {:ok, table} <- table_name(query.source),
