@@ -54,8 +54,8 @@ defmodule Scry.Engine.Exqlite.SqlCompiler do
   logic with no way to *raise* the way `Scry.Core.QueryOps.
   eval_predicate/4`'s own null-safety hard error does. Pushing a
   `WHERE age > 18` straight into SQL for a column that might genuinely
-  be `NULL` would silently exclude that row instead of raising the
-  error lang_spec.md §7 requires -- the same class of bug `Scry.
+  be `NULL` would silently exclude that row instead of raising a hard
+  error -- the same class of bug `Scry.
   Engine.ETS.MatchSpec` was built to avoid for ETS's own match-spec
   guards, except SQL genuinely has no per-row escape hatch to defer
   to (there's no downstream toolkit re-check left once a native

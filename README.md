@@ -17,8 +17,7 @@ only ever sees the `source`/`Scry.Core.Query.t()` shapes already
 produced once any kind-specific vocabulary (`LAST`, eventually `via`/
 `hops`, ...) has been lowered away.
 
-Source: <https://github.com/joetjen/scry_engine_exqlite>. Specs live in
-the separate [`scry`](https://github.com/joetjen/scry) repository; the
+Source: <https://github.com/joetjen/scry_engine_exqlite>. The
 behaviour this implements lives in
 [`scry_core`](https://github.com/joetjen/scry_core).
 

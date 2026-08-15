@@ -4,8 +4,7 @@ defmodule Scry.Engine.Exqlite.Conn do
   once via `open/2` and meant to be reused across many
   `Scry.Engine.Exqlite.execute/3` calls, unlike an ad-hoc adapter that
   opens (and closes) a fresh connection on every single call. Matches
-  the connection/config struct every real adapter exposes
-  (impl_spec.md §2).
+  the connection/config struct every real adapter exposes.
 
   `schema_cache` is an ETS table `open/2` creates alongside the
   connection -- `Scry.Engine.Exqlite`'s own per-query `NOT NULL`/type-

@@ -43,7 +43,7 @@ defmodule Scry.Engine.Exqlite.MixProject do
       # `Scry.Core.EngineBehaviour` and returns `Scry.Core.Query.t()`-
       # shaped data, so it's the real dependency, not test-only. Switch
       # to a `~> x.y` Hex requirement once scry_core is actually
-      # published (impl_spec.md's own dependency-versions convention).
+      # published.
       {:scry_core, path: "../scry_core"},
 
       # === DATABASE DRIVER ===
